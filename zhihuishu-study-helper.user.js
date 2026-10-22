@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智慧树学习辅助（自动续播 + DeepSeek答题提示）
 // @namespace    codex.local.wisdom-mooc.helper
-// @version      1.1.1
-// @description  自动续播智慧树课程视频，自动打开随堂练习，并用 DeepSeek 生成答案建议；测试模式可显式启用自动选择与提交（默认关闭）。
+// @version      1.1.2
+// @description  自动续播智慧树课程视频，自动打开随堂练习，答题后关闭结果页并恢复播放，并用 DeepSeek 生成答案建议；测试模式可显式启用自动选择与提交（默认关闭）。
 // @author       Codex
 // @match        https://wisdom-mooc.zhihuishu.com/study/*
 // @run-at       document-idle
@@ -23,6 +23,7 @@
     autoPlay: 'wmh.autoPlay',
     autoNext: 'wmh.autoNext',
     autoOpenQuiz: 'wmh.autoOpenQuiz',
+    autoResumeAfterQuiz: 'wmh.autoResumeAfterQuiz',
     aiHints: 'wmh.aiHints',
     autoSubmit: 'wmh.autoSubmit',
     apiKey: 'wmh.apiKey',
@@ -34,6 +35,7 @@
     autoPlay: true,
     autoNext: true,
     autoOpenQuiz: true,
+    autoResumeAfterQuiz: true,
     aiHints: true,
     autoSubmit: false,
     endpoint: 'https://api.deepseek.com/chat/completions',
@@ -44,6 +46,7 @@
     autoPlay: readBool(KEYS.autoPlay, DEFAULTS.autoPlay),
     autoNext: readBool(KEYS.autoNext, DEFAULTS.autoNext),
     autoOpenQuiz: readBool(KEYS.autoOpenQuiz, DEFAULTS.autoOpenQuiz),
+    autoResumeAfterQuiz: readBool(KEYS.autoResumeAfterQuiz, DEFAULTS.autoResumeAfterQuiz),
     aiHints: readBool(KEYS.aiHints, DEFAULTS.aiHints),
     autoSubmit: readBool(KEYS.autoSubmit, DEFAULTS.autoSubmit),
     autoSubmitInFlight: false,
@@ -55,6 +58,10 @@
     lastQuizEntryClick: { element: null, at: 0 },
     lastNextClickAt: 0,
     lastScanAt: 0,
+    lastActiveVideo: null,
+    lastQuizCompletionKey: '',
+    lastQuizCompletionAt: 0,
+    quizClosePending: false,
     lastQuestionHash: '',
     activeRequestHash: '',
     hintCache: new Map(),
@@ -281,7 +288,7 @@
       <div class="wmh-head">
         <div>
           <div class="wmh-title">智慧树学习辅助</div>
-          <div class="wmh-sub">视频续播 + AI 答案提示（自动提交默认关闭）</div>
+          <div class="wmh-sub">视频续播 + 答题后恢复 + AI 答案提示</div>
         </div>
         <button class="wmh-collapse" type="button">收起</button>
       </div>
@@ -290,6 +297,7 @@
           <label><input type="checkbox" id="wmh-auto-play"> 自动播放</label>
           <label><input type="checkbox" id="wmh-auto-next"> 自动下一节</label>
           <label><input type="checkbox" id="wmh-auto-open"> 自动打开题目</label>
+          <label><input type="checkbox" id="wmh-resume-after-quiz"> 答题后自动续播</label>
           <label><input type="checkbox" id="wmh-ai-hints"> DeepSeek 提示</label>
           <label class="wmh-danger"><input type="checkbox" id="wmh-auto-submit"> 测试模式：自动选择并提交</label>
         </div>
@@ -324,6 +332,7 @@
     const autoPlay = panel.querySelector('#wmh-auto-play');
     const autoNext = panel.querySelector('#wmh-auto-next');
     const autoOpen = panel.querySelector('#wmh-auto-open');
+    const resumeAfterQuiz = panel.querySelector('#wmh-resume-after-quiz');
     const aiHints = panel.querySelector('#wmh-ai-hints');
     const autoSubmit = panel.querySelector('#wmh-auto-submit');
     const apiKey = panel.querySelector('#wmh-api-key');
@@ -333,6 +342,7 @@
     autoPlay.checked = state.autoPlay;
     autoNext.checked = state.autoNext;
     autoOpen.checked = state.autoOpenQuiz;
+    resumeAfterQuiz.checked = state.autoResumeAfterQuiz;
     aiHints.checked = state.aiHints;
     autoSubmit.checked = state.autoSubmit;
     apiKey.value = state.apiKey;
@@ -353,6 +363,12 @@
       state.autoOpenQuiz = autoOpen.checked;
       saveSetting(KEYS.autoOpenQuiz, state.autoOpenQuiz);
       setStatus(state.autoOpenQuiz ? '随堂练习会自动打开。' : '随堂练习需要你手动打开。');
+    });
+
+    resumeAfterQuiz.addEventListener('change', () => {
+      state.autoResumeAfterQuiz = resumeAfterQuiz.checked;
+      saveSetting(KEYS.autoResumeAfterQuiz, state.autoResumeAfterQuiz);
+      setStatus(state.autoResumeAfterQuiz ? '答题完成后会自动关闭结果页并恢复视频。' : '答题完成后不会自动关闭结果页。');
     });
     aiHints.addEventListener('change', () => {
       state.aiHints = aiHints.checked;
@@ -437,12 +453,19 @@
   function getPrimaryVideo() {
     const videos = Array.from(document.querySelectorAll('video'))
       .filter((video) => !video.closest('#wmh-panel') && isVisible(video));
-    if (!videos.length) return null;
+
+    if (!videos.length) {
+      const fallback = state.lastActiveVideo;
+      return fallback instanceof HTMLVideoElement && fallback.isConnected ? fallback : null;
+    }
+
     videos.sort((left, right) => {
       const leftRect = left.getBoundingClientRect();
       const rightRect = right.getBoundingClientRect();
       return rightRect.width * rightRect.height - leftRect.width * leftRect.height;
     });
+
+    state.lastActiveVideo = videos[0];
     return videos[0];
   }
 
@@ -486,17 +509,30 @@
     document.querySelectorAll('video').forEach(bindVideo);
   }
 
-  function ensureVideoPlaying() {
-    if (!state.autoPlay || document.visibilityState !== 'visible' || isQuizUiVisible()) return;
+  function ensureVideoPlaying(forceAfterQuiz = false) {
+    if (!state.autoPlay) return;
+    if (getQuestionDialog()) return;
+    if (!forceAfterQuiz && firstVisible('.video-config-dialog')) return;
+
     const video = getPrimaryVideo();
     bindVideo(video);
-    if (!video || !video.paused || video.ended || video.readyState < 2) return;
+    if (video && video.paused && !video.ended && video.readyState >= 2) {
+      const promise = video.play();
+      if (promise && typeof promise.catch === 'function') {
+        promise.catch(() => {
+          setStatus('浏览器阻止了自动播放。请手动点击一次播放按钮，之后会继续自动续播。', 'warn');
+        });
+      }
+      return;
+    }
 
-    const promise = video.play();
-    if (promise && typeof promise.catch === 'function') {
-      promise.catch(() => {
-        setStatus('浏览器阻止了自动播放。请手动点击一次播放按钮，之后会继续自动续播。', 'warn');
-      });
+    if (!video) {
+      try {
+        const playerApi = pageWindow.ablePlayerX?.('container');
+        if (playerApi && typeof playerApi.play === 'function') playerApi.play();
+      } catch (error) {
+        console.warn('[学习辅助] 播放器恢复接口调用失败', error);
+      }
     }
   }
 
@@ -910,16 +946,78 @@
     }
   }
 
+
+  function isQuizCompleted(dialog) {
+    if (!dialog) return false;
+    const dialogText = normalizeText(dialog.innerText);
+    const footerText = normalizeText(
+      Array.from(dialog.querySelectorAll('.el-dialog__footer .btn, .el-dialog__footer button'))
+        .map((button) => button.innerText || button.textContent)
+        .join(' ')
+    );
+    return footerText.includes('已提交') || /回答(正确|错误)/.test(dialogText) && dialogText.includes('答案解析');
+  }
+
+  function closeCompletedQuizAndResume(dialog) {
+    if (!state.autoResumeAfterQuiz || !state.autoPlay || state.quizClosePending) return;
+
+    const completionKey = hashText(normalizeText(dialog.innerText));
+    if (state.lastQuizCompletionKey === completionKey && Date.now() - state.lastQuizCompletionAt < 5000) return;
+
+    const closeButton = dialog.querySelector('.header-icon') || dialog.querySelector('.el-dialog__headerbtn');
+    state.lastQuizCompletionKey = completionKey;
+    state.lastQuizCompletionAt = Date.now();
+
+    if (!closeButton) {
+      setStatus('检测到答题完成，但未找到结果页关闭按钮，请手动关闭后继续播放。', 'warn');
+      return;
+    }
+
+    state.quizClosePending = true;
+    setStatus('答题已完成，正在关闭结果页并恢复视频...', 'ok');
+
+    window.setTimeout(() => {
+      try {
+        const currentDialog = getQuestionDialog();
+        if (currentDialog && isQuizCompleted(currentDialog)) closeButton.click();
+      } catch (error) {
+        console.warn('[学习辅助] 关闭答题结果页失败', error);
+      }
+
+      window.setTimeout(() => {
+        state.quizClosePending = false;
+        state.lastQuestionHash = '';
+        state.lastAutoSubmitHash = '';
+        ensureVideoPlaying(true);
+
+        window.setTimeout(() => {
+          if (getQuestionDialog()) {
+            setStatus('答题结果页仍未关闭，视频恢复被暂停；请手动关闭结果页。', 'warn');
+          } else {
+            setStatus('答题已完成，已尝试恢复视频播放。', 'ok');
+          }
+        }, 900);
+      }, 900);
+    }, 700);
+  }
+
   function handleQuestionDialog() {
     const dialog = getQuestionDialog();
     if (!dialog) {
       state.lastQuestionHash = '';
       state.lastAutoSubmitHash = '';
+      state.quizClosePending = false;
       return;
     }
 
     const video = getPrimaryVideo();
     if (video && !video.paused) video.pause();
+
+    if (isQuizCompleted(dialog)) {
+      setStatus('检测到题目已提交或已显示答题结果。', 'ok');
+      closeCompletedQuizAndResume(dialog);
+      return;
+    }
 
     const questions = extractQuestions();
     if (!questions.length) {
@@ -975,6 +1073,9 @@
 
     window.setInterval(() => scanPage(), 1500);
     window.setInterval(() => ensureVideoPlaying(), parseInt(readString('wmh.playCheckInterval', '4000'), 10) || 4000);
+    document.addEventListener('visibilitychange', () => {
+      if (!isQuizUiVisible()) window.setTimeout(() => ensureVideoPlaying(), 180);
+    });
   }
 
   let observerTimer = 0;
