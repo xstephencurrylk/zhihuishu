@@ -186,6 +186,8 @@ pageWindow.PlayerStarter
 ├── zhihuishu-study-helper.user.js
 └── zhihuishu-study-helper-review-only.user.js  # 可选：仅提示、不自动提交的版本
 ```
+## 图片示例
+<img width="804" height="920" alt="image" src="https://github.com/user-attachments/assets/15d08bd8-2b22-48d5-a526-141fba71be89" />
 
 ## 更新记录
 
